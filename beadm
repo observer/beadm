@@ -1,5 +1,12 @@
 #!/bin/sh -e
 
+# pve-beadm: an extremely simplified version of the FreeBSD beadm tool, 
+# that can be used with Proxmox VE 6 to enable atomic upgrades and rollbacks
+# 
+# You should probably not use this unless you've read the code and 
+# know what's going on. I'm not to blame if you use it and something breaks 
+
+# Copyright (c) 2019-2019 tactical-documentation
 # Copyright (c) 2012-2019 Slawomir Wojciech Wojtczak (vermaden)
 # Copyright (c) 2012-2013 Bryan Drewery (bdrewery)
 # Copyright (c) 2012-2013 Mike Clarke (rawthey)
@@ -29,15 +36,35 @@ unset LC_ALL
 unset LANG
 PATH=${PATH}:/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin
 
-if [ $( uname -r | cut -d '-' -f1 | cut -d '.' -f1 ) -lt 8 ]
+
+if [ ! -f /etc/kernel/cmdline.template ] || ! $(grep -q "__BE_NAME" /etc/kernel/cmdline.template)
 then
-  echo "ERROR: beadm works on FreeBSD 8.0 or later"
+  echo "ERROR: /etc/kernel/cmdline.template not found!"
+  echo
+  echo "You need a template file for the kernel commandline."
+  echo "The template file has to be identical to the /etc/kernel/cmdline file, but instead of a specific root it must contain the string \"__BE_NAME\""
+  echo "The template file is used in order to create a valid kernel commandline for systemd-boot, which points to the correct boot environment." 
+  echo
+  echo "In order to use beadm, create a valid /etc/kernel/cmdline.template"
+  echo   
+  echo "Example: if your /etc/kernel/cmdline looks like this:"
+  echo "         root=ZFS=rpool/ROOT/pve-1 boot=zfs"
+  echo "         then the template file should contain:"
+  echo "         root=ZFS=rpool/ROOT/__BE_NAME boot=zfs"
+  echo
+  exit 1
+fi
+
+if [ "$( uname -r | cut -d '-' -f3)" != "pve" ]
+then
+  echo "ERROR: This version of beadm works on Proxmox, your kernel (uname -r) does not end with '-pve'"
   exit 1
 fi
 
 if [ "${1}" = "--version" -o "${1}" = "-version" -o "${1}" = "version" ]
 then
-  echo "beadm 1.3.0 2019/05/02"
+  echo "beadm 0.6.1 2019/10/06"
+  echo "This is a PoC, use only after reading the code!"
   exit 0
 fi
 
@@ -52,33 +79,9 @@ __usage() {
   echo "  ${NAME} rename <origBeName> <newBeName>"
   echo "  ${NAME} mount <beName> [mountpoint]"
   echo "  ${NAME} { umount | unmount } [-f] <beName>"
+  echo "  ${NAME} init <beName>"
   echo "  ${NAME} version"
   exit 1
-}
-
-# check if /boot is a symlink to a bootpool on this system
-BOOTPATH=
-if [ -L '/boot' ] && [ -d '/boot' ]
-then
-    BOOTPOOL=$( readlink '/boot' | awk -F '/' '{print $1}' )
-    BOOTPROP=$( zpool list -H -o bootfs ${BOOTPOOL} )
-    if [ "${BOOTPROP}" = "-" ]
-    then
-        BOOTPATH=/${BOOTPOOL}
-    fi
-fi
-
-# check if system has a grub.cfg file and update it
-__update_grub() {
-  if [ -e /boot/grub/grub.cfg ]
-  then
-    if grub-mkconfig -o /boot/grub/grub.cfg 1> /dev/null 2> /dev/null
-    then
-      echo "GRUB configuration updated successfully"
-    else
-      echo "WARNING: Failed to update GRUB configuration"
-    fi
-  fi
 }
 
 # check if boot environment exists
@@ -119,6 +122,28 @@ __be_clone() { # 1=DATASET
   fi
 }
 
+__get_active_be_from_esp() {
+  if [ ! -f /tmp/beadm/loader.conf ]
+  then
+    mount /dev/disk/by-uuid/$(cat /etc/kernel/pve-efiboot-uuids | head -n 1) /boot/efi
+    mkdir -p /tmp/beadm/
+    cp /boot/efi/loader/loader.conf /tmp/beadm/loader.conf
+    default_entry="$(cat /tmp/beadm/loader.conf | grep default | cut -d ' ' -f2 | sed 's/-\*$//')"
+    next_boot_environment="$(cat /boot/efi/loader/entries/$(ls /boot/efi/loader/entries/ | grep $default_entry | head -n 1) | grep options | tr ' ' '\n' | grep root= | cut -d '/' -f3)"
+    echo $next_boot_environment > /tmp/beadm/next_boot_environment
+
+    if [ ! -d /boot/efi/env/$next_boot_environment ]
+    then
+      echo 
+      echo "WARNING! There is no Boot Environment for $next_boot_environment!"
+      echo "         Use 'beadm init $next_boot_environment' to generate the necessary files on the EFI System Partitions"
+      echo 
+    fi
+    umount /boot/efi
+  fi
+}
+
+
 # create new boot environment
 __be_new() { # 1=SOURCE 2=TARGET
   local NAME_NEW=$( basename "${2}" )
@@ -142,22 +167,7 @@ __be_new() { # 1=SOURCE 2=TARGET
   unset NAME_SANITY
   local SOURCE=$( echo ${1} | cut -d '@' -f 1 )
   local ENTROPY=0
-  # secure current /boot/entropy file
-  if [ -f /boot/entropy ]
-  then
-    if ! cp -p /boot/entropy /boot/entropy.OLD 1> /dev/null 2> /dev/null
-    then
-      echo "ERROR: Can not copy current '/boot/entropy' file"
-      exit 1
-    fi
-    ENTROPY=1
-  fi
-  # create new /boot/entropy file that would be used in new boot environment
-  if ! dd if=/dev/random of=/boot/entropy bs=4096 count=1 1> /dev/null 2> /dev/null
-  then
-    echo "ERROR: Can not generate new '/boot/entropy' file"
-    exit 1
-  fi
+
   # create snapshot that will be used as a base for new boot environment
   if __be_snapshot ${1}
   then
@@ -169,13 +179,7 @@ __be_new() { # 1=SOURCE 2=TARGET
           if ! zfs list -H -o name ${FS}@${SNAPSHOT} 1> /dev/null 2> /dev/null
           then
             echo "ERROR: Child snapshot '${FS}@${SNAPSHOT}' does not exist"
-            if [ ${ENTROPY} -ne 0 ]
-            then
-              if ! mv /boot/entropy.OLD /boot/entropy 1> /dev/null 2> /dev/null
-              then
-                echo "WARNING: Can not bring back original '/boot/entropy' file"
-              fi
-            fi
+
             exit 1
           fi
         done
@@ -184,13 +188,6 @@ __be_new() { # 1=SOURCE 2=TARGET
     if zfs list -H -o name ${1}@${2##*/} 1> /dev/null 2> /dev/null
     then
       echo "ERROR: Snapshot '${1}@${2##*/}' already exists"
-      if [ ${ENTROPY} -ne 0 ]
-      then
-        if ! mv /boot/entropy.OLD /boot/entropy 1> /dev/null 2> /dev/null
-        then
-          echo "WARNING: Can not bring back original '/boot/entropy' file"
-        fi
-      fi
       exit 1
     fi
     # snapshot format
@@ -198,25 +195,11 @@ __be_new() { # 1=SOURCE 2=TARGET
     if ! zfs snapshot -r ${1}@${FMT} 1> /dev/null 2> /dev/null
     then
       echo "ERROR: Cannot create snapshot '${1}@${FMT}'"
-      if [ ${ENTROPY} -ne 0 ]
-      then
-        if ! mv /boot/entropy.OLD /boot/entropy 1> /dev/null 2> /dev/null
-        then
-          echo "WARNING: Can not bring back original '/boot/entropy' file"
-        fi
-      fi
       exit 1
     fi
   fi
-  # bring back secured /boot/entropy.OLD file
-  if [ -f /boot/entropy.OLD ]
-  then
-    if ! mv /boot/entropy.OLD /boot/entropy 1> /dev/null 2> /dev/null
-    then
-      echo "WARNING: Can not bring back original '/boot/entropy' file"
-    fi
-  fi
-  unset ENTROPY
+
+
   # clone properties of source boot environment
   zfs list -H -o name -r ${SOURCE} \
     | grep -v '@' \
@@ -243,20 +226,9 @@ EOF
           eval "zfs clone -o canmount=off ${OPTS} ${FS}@${FMT} ${DATASET}"
         fi
       done
-      # check if we need to update grub
-      if [ "${GRUB}" = YES ]
-      then
-        __update_grub
-      fi
 }
 
 ROOTFS=$( mount | awk '/ \/ / {print $1}' )
-
-if echo ${ROOTFS} | grep -q -m 1 -E "^/dev/"
-then
-  echo "ERROR: This system does not boot from ZFS pool"
-  exit 1
-fi
 
 POOL=$( echo ${ROOTFS} | awk -F '/' '{print $1}' )
 
@@ -274,215 +246,105 @@ then
  exit 1
 fi
 
-if [ -f /usr/local/etc/beadm.conf ]
-then
-  . /usr/local/etc/beadm.conf
-fi
-
-# update GRUB bootloader instead of FreeBSD's loader(8)
-: ${GRUB="NO"}
-
 # use other prefix then the 'pool/ROOT/bename' default
 : ${BEDS="$( echo ${ROOTFS} | awk -F '/' '{print $2}' )"}
 
 case ${1} in
 
   (list) # --------------------------------------------------------------------
-    OPTION_a=0
-    OPTION_D=0
-    OPTION_s=0
-    shift
-    while getopts "aDHs" OPT
-    do
-      case ${OPT} in
-        (a) OPTION_a=1 ;;
-        (D) OPTION_D=1 ;;
-        (H) OPTION_H=1 ;;
-        (s) OPTION_s=1
-            OPTION_a=1 ;;
-        (*) __usage    ;;
-      esac
+    echo "Boot Environments on $(hostname):"
+    zfs_list="$(zfs list -H -t filesystem,snapshot,volume -s creation -o name,used,usedds,usedbysnapshots,usedrefreserv,refer,creation,origin -r $POOL/$BEDS | grep "^$POOL/$BEDS/" | sed 's/\t/,/g;s/\n/;/g;s/ /_/g')"
+
+    #echo $zfs_list
+
+    __get_active_be_from_esp
+
+    printf "%-20s %-10s %-10s %-7s %-8s %-7s %-7s %-30s %-10s\n" name state used ds snaps ubrr refs "creation date" origin
+    printf "%-20s %-10s %-10s %-7s %-8s %-7s %-7s %-30s %-10s\n" ---- ----- ---- -- ----- ---- ---- --------------------- ------
+    for line in $(echo $zfs_list | tr ';' '\n'); do
+      BE_NAME="$(echo $line | cut -d ',' -f1 | sed "s/^$POOL\/$BEDS\///")"
+      BE_ACTIVE="$(if [ "$ROOTFS" = "$(echo $line | cut -d ',' -f1)" ]; then echo N; else echo ' '; fi)"
+      BE_NEXT="$(if [ "$BE_NAME" = "$(cat /tmp/beadm/next_boot_environment)" ]; then echo R; else echo ' '; fi)"
+      BE_STATE="$(if [ "$BE_ACTIVE$BE_NEXT" = "  " ]; then echo "-"; else echo "$BE_ACTIVE$BE_NEXT"; fi)"
+      BE_USED="$(echo $line | cut -d ',' -f2)"
+      BE_USEDDS="$(echo $line | cut -d ',' -f3)"
+      BE_USEDBYSNAPSHOTS="$(echo $line | cut -d ',' -f4)"
+      BE_USEDREFRESERV="$(echo $line | cut -d ',' -f5)"
+      BE_REFER="$(echo $line | cut -d ',' -f6)"
+      BE_DATE="$(echo $line | cut -d ',' -f7 | sed 's/_/ /g')"
+      BE_ORIGIN="$(echo $line | cut -d ',' -f8)"
+      
+
+      if ! echo $line | cut -d ',' -f 1 | grep -q "@"; then
+        printf "%-20s %-10s %-10s %-7s %-8s %-7s %-7s %-30s %-10s\n" $BE_NAME $BE_STATE $BE_USED $BE_USEDDS $BE_USEDBYSNAPSHOTS $BE_USEDREFRESERV $BE_REFER "$BE_DATE" "$BE_ORIGIN"
+      fi 
     done
-    awk -v POOL="${POOL}" \
-        -v BEDS="${BEDS}" \
-        -v ROOTFS="${ROOTFS}" \
-        -v BOOTFS="${BOOTFS}" \
-        -v OPTION_a="${OPTION_a}" \
-        -v OPTION_D="${OPTION_D}" \
-        -v OPTION_H="${OPTION_H}" \
-        -v OPTION_s="${OPTION_s}" \
-     'function __normalize(VALUE) {
-        if(VALUE == "-" || VALUE == 0)
-          return 0
-        else
-          return substr(VALUE, 1, length(VALUE) - 1) * MULTIPLIER[substr(VALUE, length(VALUE))]
-      }
-      function __show_units(VALUE) {
-             if(VALUE < 1024)                {                               UNIT = "K"; }
-        else if(VALUE < 1048576)             { VALUE /= 1024;                UNIT = "M"; }
-        else if(VALUE < 1073741824)          { VALUE /= 1048576;             UNIT = "G"; }
-        else if(VALUE < 1099511627776)       { VALUE /= 1073741824;          UNIT = "T"; }
-        else if(VALUE < 1125899906842624)    { VALUE /= 1099511627776;       UNIT = "P"; }
-        else if(VALUE < 1152921504606846976) { VALUE /= 1125899906842624;    UNIT = "E"; }
-        else                                 { VALUE /= 1152921504606846976; UNIT = "Z"; }
-        return sprintf("%.1f%s", VALUE, UNIT)
-      }
-      function __get_bename(BENAME) {
-        sub(BENAME_BEGINS_WITH "\/", "", BENAME)
-        sub("/.*", "", BENAME)
-        return BENAME
-      }
-      function __convert_date(DATE) {
-        CMD_DATE = "date -j -f \"%a %b %d %H:%M %Y\" \"" DATE "\" +\"%Y-%m-%d %H:%M\""
-        CMD_DATE | getline NEW
-        close(CMD_DATE)
-        return NEW
-      }
-      BEGIN {
-        BENAME_BEGINS_WITH = POOL "/" BEDS
-        MULTIPLIER["K"] = 1
-        MULTIPLIER["M"] = 1024
-        MULTIPLIER["G"] = 1048576
-        MULTIPLIER["T"] = 1073741824
-        MULTIPLIER["P"] = 1099511627776
-        MULTIPLIER["E"] = 1125899906842624
-        MULTIPLIER["Z"] = 1152921504606846976
-        MOUNTPOINT_LENGTH = 10
-        FSNAME_LENGTH = 2
-        if(OPTION_a == 1)
-          FSNAME_LENGTH = 19
-        CMD_MOUNT="mount"
-        while(CMD_MOUNT | getline)
-          if($1 ~ "^" BENAME_BEGINS_WITH)
-            MOUNTS[$1] = $3
-        close(CMD_MOUNT)
-        FS = "\\t"
-        CMD_ZFS_LIST = "zfs list -H -t filesystem,snapshot,volume -s creation -o name,used,usedds,usedbysnapshots,usedrefreserv,refer,creation,origin -r "
-        while(CMD_ZFS_LIST BENAME_BEGINS_WITH | getline) {
-          if($1 != BENAME_BEGINS_WITH) {
-            FSNAME = $1
-            FSNAMES[length(FSNAMES) + 1] = FSNAME
-            USED              = __normalize($2)
-            USEDBYDATASET     = __normalize($3)
-            USEDBYSNAPSHOTS   = __normalize($4)
-            USEDREFRESERV     = __normalize($5)
-            REFER[FSNAME]     = __normalize($6)
-            CREATIONS[FSNAME] = $7
-            ORIGINS[FSNAME]   = $8
-            if(FSNAME ~ /@/)
-              SPACES[FSNAME] = USED
-            else {
-              SPACES[FSNAME] = USEDBYDATASET + USEDREFRESERV
-              if(OPTION_D != 1)
-                SPACES[FSNAME] += USEDBYSNAPSHOTS
-              BE = " " __get_bename(FSNAME) " "
-              if(index(BELIST, BE) == 0)
-                BELIST = BELIST " " BE
-              MOUNTPOINT = MOUNTS[FSNAME]
-              if(MOUNTPOINT) {
-                if((OPTION_a == 0 && FSNAME == (BENAME_BEGINS_WITH "/" __get_bename(FSNAME))) || (OPTION_a == 1)) {
-                  LM = length(MOUNTPOINT)
-                  if(LM > MOUNTPOINT_LENGTH)
-                    MOUNTPOINT_LENGTH = LM
-                }
-              }
-              else
-                MOUNTPOINT = "-"
-            }
-            if(OPTION_a == 1)
-              LF = length(FSNAME)
-            else if(FSNAME !~ /@/)
-              LF = length(__get_bename(FSNAME))
-            if(LF > FSNAME_LENGTH)
-              FSNAME_LENGTH = LF
-          }
-        }
-        close(CMD_ZFS_LIST BENAME_BEGINS_WITH)
-        split(BELIST, BENAMES, " ")
-        if(OPTION_a == 1) {
-          BE_HEAD = "BE/Dataset/Snapshot"
-          printf "%-" FSNAME_LENGTH + 2 "s %-6s %-" MOUNTPOINT_LENGTH "s %6s %s\n", BE_HEAD, "Active", "Mountpoint", "Space", "Created"
-        }
-        else if(OPTION_H == 1)
-          BE_HEAD = ""
-        else {
-          BE_HEAD = "BE"
-          printf "%-" FSNAME_LENGTH "s %-6s %-" MOUNTPOINT_LENGTH "s %6s %s\n", BE_HEAD, "Active", "Mountpoint", "Space", "Created"
-        }
-        if(OPTION_s != 1)
-          SNAPSHOT_FILTER = "(/[^@]*)?$"
-        for(I = 1; I <= length(BENAMES); I++) {
-          BENAME = BENAMES[I]
-          if(OPTION_a == 1) {
-            printf "\n"
-            print BENAME
-            for(J = 1; J <= length(FSNAMES); J++) {
-              FSNAME = FSNAMES[J]
-              if(FSNAME ~ "^" BENAME_BEGINS_WITH "/" BENAME SNAPSHOT_FILTER) {
-                ACTIVE = ""
-                if(FSNAME == ROOTFS)
-                  ACTIVE = ACTIVE "N"
-                if(FSNAME == BOOTFS)
-                  ACTIVE = ACTIVE "R"
-                if(! ACTIVE)
-                  ACTIVE = "-"
-                MOUNTPOINT = MOUNTS[FSNAME]
-                if(! MOUNTPOINT)
-                  MOUNTPOINT = "-"
-                printf "  %-" FSNAME_LENGTH "s %-6s %-" MOUNTPOINT_LENGTH "s %6s %s\n", FSNAME, ACTIVE, MOUNTPOINT, __show_units(SPACES[FSNAME]), __convert_date(CREATIONS[FSNAME])
-                ORIGIN = ORIGINS[FSNAME]
-                ORIGIN_DISPLAY = ORIGIN
-                sub(BENAME_BEGINS_WITH "/", "", ORIGIN_DISPLAY)
-                if(ORIGIN != "-") {
-                  if(OPTION_D == 1)
-                    SPACE = REFER[ORIGIN]
-                  else
-                    SPACE = SPACES[ORIGIN]
-                  printf  "  %-" FSNAME_LENGTH "s %-6s %-" MOUNTPOINT_LENGTH "s %6s %s\n", "  " ORIGIN_DISPLAY, "-", "-", __show_units(SPACE), __convert_date(CREATIONS[ORIGIN])
-                }
-              }
-            }
-          }
-          else {
-            SPACE = 0
-            ACTIVE = ""
-            NAME = BENAME_BEGINS_WITH "/" BENAME
-            if(NAME == ROOTFS)
-              ACTIVE = ACTIVE "N"
-            if(NAME == BOOTFS)
-              ACTIVE = ACTIVE "R"
-            if(! ACTIVE)
-              ACTIVE = "-"
-            for(J = 1; J <= length(FSNAMES); J++) {
-              FSNAME = FSNAMES[J]
-              if(FSNAME ~ "^" BENAME_BEGINS_WITH "/" BENAME "(/[^@]*)?$") {
-                if((BENAME_BEGINS_WITH "/" BENAME) == FSNAME) {
-                  MOUNTPOINT = MOUNTS[FSNAME]
-                  if(! MOUNTPOINT)
-                    MOUNTPOINT = "-"
-                  CREATION = __convert_date(CREATIONS[FSNAME])
-                }
-                ORIGIN = ORIGINS[FSNAME]
-                if(ORIGIN == "-")
-                  SPACE += SPACES[FSNAME]
-                else {
-                  if(OPTION_D == 1)
-                    SPACE += REFER[FSNAME]
-                  else
-                    SPACE += SPACES[FSNAME] + SPACES[ORIGIN]
-                }
-              }
-            }
-            if(OPTION_H == 1)
-              printf "%s\t%s\t%s\t%s\t%s\n", BENAME, ACTIVE, MOUNTPOINT, __show_units(SPACE), CREATION
-            else
-              printf "%-" FSNAME_LENGTH "s %-6s %-" MOUNTPOINT_LENGTH "s %6s %s\n", BENAME, ACTIVE, MOUNTPOINT, __show_units(SPACE), CREATION
-          }
-        }
-      }' 2> /dev/null
     ;;
 
+  (init) # ------------------------------------------------------------------
+    case ${#} in
+      (2)
+        be_name="${2}"
+        ;;
+      (*)
+        __usage
+        ;;
+    esac
+
+    if $(zfs get canmount rpool/ROOT/$be_name | grep -q on)
+    then 
+      zfs set canmount=off ${POOL}/${BEDS}/$be_name
+    fi
+    
+    __get_active_be_from_esp
+    
+    mount /dev/disk/by-uuid/$(cat /etc/kernel/pve-efiboot-uuids | head -n 1) /boot/efi
+    if [ -d /boot/efi/env/$be_name ]
+    then 
+      echo "ERROR! $be_name already exists!"
+      umount /boot/efi
+      exit 1
+    fi
+    umount /boot/efi
+
+
+    old_be_name="$(cat /etc/kernel/cmdline | tr ' ' '\n' | grep root | cut -d '/' -f3)"
+
+    cat /etc/kernel/cmdline.template | sed "s/__BE_NAME/$be_name/" > /etc/kernel/cmdline
+
+    pve-efiboot-tool refresh
+
+    cat /etc/kernel/cmdline.template | sed "s/__BE_NAME/$old_be_name/" > /etc/kernel/cmdline
+
+    for esp in $(cat /etc/kernel/pve-efiboot-uuids)
+    do
+      mount /dev/disk/by-uuid/$esp /boot/efi
+
+
+      mkdir -p /boot/efi/env/$be_name
+      cp -r /boot/efi/EFI/proxmox/* /boot/efi/env/$be_name/
+      cat /boot/efi/loader/loader.conf | sed "/default/c\default $be_name-*" > /boot/efi/env/$be_name/loader.conf
+      for entry in $(ls /boot/efi/loader/entries/ | grep proxmox-.*-pve.conf)
+      do
+        new_entry="$(echo $entry | sed "s/proxmox/$be_name/;s/-pve//")"
+        cp /boot/efi/loader/entries/$entry /boot/efi/loader/entries/$new_entry
+        sed -i "s/EFI/env/" /boot/efi/loader/entries/$new_entry
+        sed -i "s/proxmox/$be_name/" /boot/efi/loader/entries/$new_entry
+        sed -i "s/Proxmox Virtual Environment/$be_name/" /boot/efi/loader/entries/$new_entry 
+      done
+      rm -f /boot/efi/loader/loader.conf
+      cp /tmp/beadm/loader.conf /boot/efi/loader/loader.conf
+      umount /boot/efi
+    done
+
+    echo "Boot Environment for $be_name has been generated successfully!"
+
+    ;; 
+
   (create) # ------------------------------------------------------------------
+    
+    be_name=""
+
     case ${#} in
       (4)
         if ! [ ${2} = "-e" ]
@@ -502,6 +364,7 @@ case ${1} in
           exit 1
         fi
         __be_new ${POOL}/${BEDS}/${3} ${POOL}/${BEDS}/${4}
+        be_name="${4}"
         ;;
       (2)
         if __be_snapshot ${2}
@@ -513,153 +376,93 @@ case ${1} in
           fi
         else
           __be_new ${ROOTFS} ${POOL}/${BEDS}/${2}
+          be_name="${2}"
         fi
         ;;
       (*)
         __usage
         ;;
     esac
+
+    # if we reach this point ${POOL}/${BEDS}/$be_name has been created, set canmount=off
+    zfs set canmount=off ${POOL}/${BEDS}/$be_name
+
+    __get_active_be_from_esp
+    
+    old_be_name="$(cat /etc/kernel/cmdline | tr ' ' '\n' | grep root | cut -d '/' -f3)"
+
+    cat /etc/kernel/cmdline.template | sed "s/__BE_NAME/$be_name/" > /etc/kernel/cmdline
+
+    pve-efiboot-tool refresh
+
+    cat /etc/kernel/cmdline.template | sed "s/__BE_NAME/$old_be_name/" > /etc/kernel/cmdline
+
+    for esp in $(cat /etc/kernel/pve-efiboot-uuids)
+    do
+      mount /dev/disk/by-uuid/$esp /boot/efi
+      mkdir -p /boot/efi/env/$be_name
+      cp -r /boot/efi/EFI/proxmox/* /boot/efi/env/$be_name/
+      cat /boot/efi/loader/loader.conf | sed "/default/c\default $be_name-*" > /boot/efi/env/$be_name/loader.conf
+      for entry in $(ls /boot/efi/loader/entries/ | grep proxmox-.*-pve.conf)
+      do
+        new_entry="$(echo $entry | sed "s/proxmox/$be_name/;s/-pve//")"
+        cp /boot/efi/loader/entries/$entry /boot/efi/loader/entries/$new_entry
+        sed -i "s/EFI/env/" /boot/efi/loader/entries/$new_entry
+        sed -i "s/proxmox/$be_name/" /boot/efi/loader/entries/$new_entry
+        sed -i "s/Proxmox Virtual Environment/$be_name/" /boot/efi/loader/entries/$new_entry 
+      done
+      rm /boot/efi/loader/loader.conf
+      cp /tmp/beadm/loader.conf /boot/efi/loader/loader.conf
+      umount /boot/efi
+    done
+
     echo "Created successfully"
+
     ;;
 
   (activate) # ----------------------------------------------------------------
-    if [ ${#} -ne 2 ]
-    then
-      __usage
-    fi
-    __be_exist ${POOL}/${BEDS}/${2}
-    if [ "${BOOTFS}" = "${POOL}/${BEDS}/${2}" ]
-    then
-      echo "Already activated"
-      exit 0
-    else
-      if __be_mounted ${POOL}/${BEDS}/${2}
+    be_name="${2}"
+
+    switch="true"
+
+    for esp in $(cat /etc/kernel/pve-efiboot-uuids)
+    do
+      mount /dev/disk/by-uuid/$esp /boot/efi
+      rm -f /boot/efi/loader/loader.conf
+
+      if [ ! -f /boot/efi/env/$be_name/loader.conf ]
       then
-        MNT=$( mount | grep -E "^${POOL}/${BEDS}/${2} " | awk '{print $3}' )
-        if [ "${MNT}" != "/" ]
-        then
-          # boot environment is not current root and its mounted
-          echo "Attempt to unmount boot environment '${2}' mounted at '${MNT}'"
-          if ! umount ${MNT} 1> /dev/null 2> /dev/null
-          then
-            echo "ERROR: Unable to unmount boot environment '${2}' mounted at '${MNT}'"
-            echo "ERROR: Cannot activate manually mounted boot environment '${2}'"
-            exit 1
-          fi
-        echo "Gracefully unmounted boot environment '${2}' from '${MNT}' mount point"
-        fi
+        echo "ERROR! File not found: /boot/efi/env/$be_name/loader.conf"
+        echo "       Are you sure that the Boot Environment for $be_name has been initialized?"
+        echo "       If not try: 'beadm init $be_name"
+        umount /boot/efi
+        exit 1   
       fi
-      # do not change root (/) mounted boot environment mountpoint
-      HAVE_ZFSBE=0
-      if [ "${ROOTFS}" != "${POOL}/${BEDS}/${2}" ]
+
+      cp /boot/efi/env/$be_name/loader.conf /boot/efi/loader/loader.conf
+
+      if $switch
       then
-        TMPMNT=$( mktemp -d -t BE-${2} )
-        if ! mkdir -p ${TMPMNT} 2> /dev/null
-        then
-          echo "ERROR: Cannot create '${TMPMNT}' directory"
-          exit 1
-        fi
-        MOUNT=0
-        while read FS MNT TYPE OPTS DUMP FSCK;
-        do
-          if [ "${FS}" = "${POOL}/${BEDS}/${2}" ]
-          then
-            MOUNT=${MNT}
-            break
-          fi
-        done << EOF
-$( mount -p )
-EOF
-        if [ ${MOUNT} -eq 0 ]
-        then
-          zfs set canmount=noauto ${POOL}/${BEDS}/${2}
-          zfs set mountpoint=${TMPMNT} ${POOL}/${BEDS}/${2}
-          zfs mount ${POOL}/${BEDS}/${2}
-        else
-          TMPMNT=${MOUNT}
-        fi
-        if [ -f ${TMPMNT}/etc/rc.d/zfsbe ]; then
-          HAVE_ZFSBE=1
-        fi
-        if [ -f /boot/zfs/zpool.cache ]
-        then
-            if [ -z "${BOOTPATH}" ]
-            then
-                cp /boot/zfs/zpool.cache ${TMPMNT}/boot/zfs/zpool.cache
-            fi
-        else
-          rm -f ${TMPMNT}/boot/zfs/zpool.cache
-        fi
-        LOADER_CONFIGS=${TMPMNT}/boot/loader.conf
-        if [ -f ${TMPMNT}/boot/loader.conf.local ]
-        then
-          LOADER_CONFIGS="${LOADER_CONFIGS} ${TMPMNT}/boot/loader.conf.local"
-        else
-            if [ -n "${BOOTPATH}" ]
-            then
-                LOADER_CONFIGS=${BOOTPATH}/boot/loader.conf
-                if [ -f ${BOOTPATH}/boot/loader.conf.local ]
-                then
-                    LOADER_CONFIGS="${LOADER_CONFIGS} ${BOOTPATH}/boot/loader.conf.local"
-                fi
-            fi
-        fi
-        sed -i '' -E s/"^vfs.root.mountfrom=.*$"/"vfs.root.mountfrom=\"zfs:${POOL}\/${BEDS}\/${2##*/}\""/g ${LOADER_CONFIGS}
-        if [ ${MOUNT} -eq 0 ]
-        then
-          zfs umount ${POOL}/${BEDS}/${2}
-          zfs set mountpoint=/ ${POOL}/${BEDS}/${2}
-        fi
+        mkdir -p /tmp/beadm
+        cp /boot/efi/env/$be_name/loader.conf /tmp/beadm/loader.conf
+        echo $be_name > /tmp/beadm/next_boot_environment
+        switch="false"
       fi
-      if ! zpool set bootfs=${POOL}/${BEDS}/${2} ${POOL} 1> /dev/null 2> /dev/null
-      then
-        echo "ERROR: Failed to activate '${2}' boot environment"
-        exit 1
-      fi
-    fi
-    # execute ZFS LIST only once
-    ZFS_LIST=$( zfs list -t filesystem -H -o name -r ${POOL}/${BEDS} )
-    # disable automatic mount on all inactive boot environments
-    echo "${ZFS_LIST}" \
-      | grep -v "^${POOL}/${BEDS}$" \
-      | grep -v "^${POOL}/${BEDS}/${2}$" \
-      | grep -v "^${POOL}/${BEDS}/${2}/" \
-      | while read NAME
-        do
-          zfs set canmount=noauto ${NAME}
-        done
-    # enable automatic mount for active boot environment and promote it
-    if [ ${HAVE_ZFSBE} -eq 1 ]; then
-      ZFSBE_CANMOUNT=noauto
-    else
-      ZFSBE_CANMOUNT=on
-    fi
-    echo "${ZFS_LIST}" \
-      | grep -E "^${POOL}/${BEDS}/${2}(/|$)" \
-      | while read NAME
-        do
-          zfs set canmount=${ZFSBE_CANMOUNT} ${NAME}
-          while __be_clone ${NAME}
-          do
-            zfs promote ${NAME}
-          done
-        done
-    # check if we need to update grub
-    if [ "${GRUB}" = YES ]
-    then
-      __update_grub
-    fi
-    # allow reboot -r to change to the new root filesystem
-    kenv vfs.root.mountfrom="zfs:${POOL}/${BEDS}/${2}" 1>/dev/null 2>/dev/null
-    echo "Activated successfully"
+      umount /boot/efi
+    done
+   
+    echo "$be_name has been activated successfully"
+
     ;;
 
   (destroy) # -----------------------------------------------------------------
     if [ "${2}" != "-F" ]
     then
       DESTROY=${2}
+      be_name="${2}"
     else
       DESTROY=${3}
+      be_name="${3}"
     fi
     __be_exist ${POOL}/${BEDS}/${DESTROY}
     case ${#} in
@@ -713,7 +516,11 @@ EOF
           # check if boot environment was created from existing snapshot
           ORIGIN=$( zfs list -H -o origin ${POOL}/${BEDS}/${DESTROY} )
           CREATION=$( zfs list -H -o creation ${POOL}/${BEDS}/${DESTROY} )
-          CREATION=$( date -j -f "%a %b %d %H:%M %Y" "${CREATION}" +"%Y-%m-%d-%H:%M" )
+
+          #FreeBSD's Date works differently than the GNU date, here we want to convert between formats:
+          #CREATION=$( date -f "%a %b %d %H:%M %Y" "${CREATION}" +"%Y-%m-%d-%H:%M" )
+          CREATION=$( date -d "${CREATION}" +"%Y-%m-%d-%H:%M" )
+
           SNAPSHOT_NAME=$( echo "${ORIGIN}" | cut -d '@' -f 2 | sed -E 's/:[0-9]{2}$//g' )
           if [ "${2}" = "-F" ]
           then
@@ -771,11 +578,18 @@ EOF
                     done
               done
         fi
-        # check if we need to update grub
-        if [ "${GRUB}" = YES ]
-        then
-          __update_grub
-        fi
+        
+        for esp in $(cat /etc/kernel/pve-efiboot-uuids)
+        do
+          mount /dev/disk/by-uuid/$esp /boot/efi
+          rm -rf /boot/efi/env/$be_name/
+          for entry in $(ls /boot/efi/loader/entries/ | grep $be_name)
+          do 
+            rm -f /boot/efi/loader/entries/$entry
+          done
+          umount /boot/efi
+        done
+
         echo "Destroyed successfully"
         ;;
       (*)
@@ -795,23 +609,30 @@ EOF
       echo "ERROR: Boot environment '${3}' already exists"
       exit 1
     fi
-    zfs rename -u ${POOL}/${BEDS}/${2} ${POOL}/${BEDS}/${3}
-  # check if we need to update loader config
-  if [ "${BOOTFS}" = "${POOL}/${BEDS}/${2}" ]
-  then
-    LOADER_CONFIGS=/boot/loader.conf
-        if [ -f /boot/loader.conf.local ]
-        then
-          LOADER_CONFIGS="${LOADER_CONFIGS} /boot/loader.conf.local"
-        fi
-        sed -i '' -E s/"^vfs.root.mountfrom=.*$"/"vfs.root.mountfrom=\"zfs:${POOL}\/${BEDS}\/${3##*/}\""/g ${LOADER_CONFIGS}
-  fi
-    # check if we need to update grub
-    if [ "${GRUB}" = YES ]
-    then
-      __update_grub
-    fi
-    echo "Renamed successfully"
+    zfs rename ${POOL}/${BEDS}/${2} ${POOL}/${BEDS}/${3}
+
+    be_name=${2}
+    new_be_name=${3}
+ 
+    for esp in $(cat /etc/kernel/pve-efiboot-uuids)
+    do
+
+      mount /dev/disk/by-uuid/$esp /boot/efi
+      mv /boot/efi/env/$be_name/ /boot/efi/env/$new_be_name/
+      sed -i "s/$be_name/$new_be_name/" /boot/efi/env/$new_be_name/loader.conf
+      sed -i "s/$be_name/$new_be_name/" /boot/efi/loader/loader.conf
+      for entry in $(ls /boot/efi/loader/entries/ | grep $be_name)
+      do 
+        sed -i "s/$be_name/$new_be_name/" /boot/efi/loader/entries/$entry
+        new_entry_name=$(echo $entry | sed "s/$be_name/$new_be_name/")
+        mv /boot/efi/loader/entries/$entry /boot/efi/loader/entries/$new_entry_name
+      done
+      umount /boot/efi
+    done
+
+    echo $new_be_name > /tmp/beadm/next_boot_environment
+    sed -i "/default $be_name-*/c\default $new_be_name-*" /tmp/beadm/loader.conf
+
     ;;
 
   (mount) # ------------------------------------------------------------
@@ -836,7 +657,7 @@ EOF
       echo "ERROR: Cannot create '${TARGET}' mountpoint"
       exit 1
     fi
-    if ! mount -t zfs ${POOL}/${BEDS}/${2} ${TARGET}
+    if ! mount -t zfs -o zfsutil ${POOL}/${BEDS}/${2} ${TARGET}
     then
       echo "ERROR: Cannot mount '${2}' at '${TARGET}' mountpoint"
       exit 1
@@ -874,6 +695,7 @@ EOF
           fi
         done
     echo "Mounted successfully on '${TARGET}'"
+
     ;;
 
   (umount|unmount) # ----------------------------------------------------------
