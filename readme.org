@@ -2,4 +2,6 @@
 
 Utility to manage Boot Environments on Proxmox VE ZFS installations.
 
+The usage has been described [[https://tactical-documentation.github.io/post/a-boot-environment-manager-for-proxmox/][here]] (or [[https://github.com/tactical-documentation/org][here]]).
+
 This is a fork of the [[https://github.com/vermaden/beadm][FreeBSD beadm utility]].
